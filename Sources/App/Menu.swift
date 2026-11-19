@@ -47,6 +47,35 @@ final class Menu: NSObject {
     }
   }
 
+  /// The app's cost over the last hour, drawn once when the menu opens; a gap
+  /// where it was not painting.
+  private final class Graph: NSView {
+    private let values: [Double?]
+    init(_ values: [Double?], tip: String) {
+      self.values = values
+      super.init(frame: CGRect(x: 0, y: 0, width: 240, height: 26))
+      autoresizingMask = [.width]
+      toolTip = tip
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirty: NSRect) {
+      let top = max(values.compactMap { $0 }.max() ?? 0, 0.001)
+      let left = 20.0, width = bounds.width - 34, step = width / 119
+      let path = NSBezierPath()
+      path.lineWidth = 1
+      var drawing = false
+      for (i, v) in values.enumerated() {
+        guard let v else { drawing = false; continue }
+        let point = CGPoint(x: left + Double(120 - values.count + i) * step, y: 4 + v / top * (bounds.height - 8))
+        if drawing { path.line(to: point) } else { path.move(to: point) }
+        drawing = true
+      }
+      NSColor.secondaryLabelColor.setStroke()
+      path.stroke()
+    }
+  }
+
   /// The start of the program's own UUID (the linker gives every build one;
   /// `dwarfdump --uuid` and crash reports show the same).
   static let build: String = {
@@ -119,6 +148,14 @@ final class Menu: NSObject {
     m.addItem(Item("Skip ahead", active: canAct, tip: "Moves half a screen") { self.p.skip(0.5) })
     m.addItem(Item("New landscape", active: canAct, tip: "Blank paper, new seed") { self.p.newLandscape() })
 
+    // The least work in one go: the screen saver's settings, and the back
+    // layer the system draws most cheaply.
+    let lightest = Landscape.saverDefaults.merging(["back": "opaque"]) { $1 }
+    let isLightest = lightest.allSatisfy { k, v in NSDictionary(dictionary: [k: p.options[k] ?? NSNull()]).isEqual(to: [k: v]) }
+    m.addItem(.separator())
+    m.addItem(Item("Lightest settings", checked: isLightest,
+                   tip: "One layer, half resolution, 6 frames a second, ten minutes a screen, less energy") { self.p.apply(lightest) })
+
     // Not in the original, which has a list of each: here they slide.
     // Time per screen from 15 s to 10 min, each step the same part faster.
     let times: [Double] = [0.25, 0.5, 1, 2, 5, 10]
@@ -137,11 +174,14 @@ final class Menu: NSObject {
     m.addItem(Slider(value: log(now / 0.25) / log(40), from: 0, to: 1, header: m.items.last!,
                      tip: "Time for the brush to cross one screen",
                      say: { say(time($0)) }, apply: { self.p.apply(["minutesPerScreen": time($0)]) }))
-    let fps = p.number(p.options["fps"], 6, 60, 12)
-    m.addItem(.sectionHeader(title: "Motion · \(Int(fps)) fps"))
+    // At most the slider's; the motion asks for fewer when it is slow, and
+    // what macOS spends moving the picture follows how many.
+    let fps = p.number(p.options["fps"], 6, 60, 12), running = Int(p.fpsNow.rounded())
+    func motion(_ f: Double) -> String { "Motion · up to \(Int(f.rounded())) fps" + (running < Int(f.rounded()) ? " · now \(running)" : "") }
+    m.addItem(.sectionHeader(title: motion(fps)))
     m.addItem(Slider(value: fps, from: 6, to: 60, header: m.items.last!,
                      tip: "Frames per second at most: more is smoother and costs more",
-                     say: { "Motion · \(Int($0.rounded())) fps" }, apply: { self.p.apply(["fps": $0.rounded()]) }))
+                     say: { motion($0) }, apply: { self.p.apply(["fps": $0.rounded()]) }))
     // Not in the original, whose strips are always the screen's size.
     let res = (p.number(p.options["resolution"], 0.5, 1, 1) * 20).rounded() * 5
     m.addItem(.sectionHeader(title: "Resolution · \(Int(res)) %"))
@@ -162,6 +202,29 @@ final class Menu: NSObject {
            (3, "3 layers", "Far, middle and near; the most expensive")]) {
       self.p.apply($0 == 1 ? ["depth": false] : ["depth": true, "layers": $0])
     }
+    // How the back layer is kept: what the user gets, not how.
+    group("Prefer", p.back,
+          [(.opaque, "Less energy", "The Mac's graphics do the least work. Uses about twice the memory"),
+           (.mono, "Less memory", "About half the memory. The graphics work a little harder at every frame")]) {
+      self.p.apply(["back": $0.rawValue])
+    }
+    m.addItem(Item("Ease off in Low Power Mode", checked: p.easeLowPower, tip: "Half the frames while the Mac is in Low Power Mode") {
+      self.p.apply(["easeLowPower": !self.p.easeLowPower])
+    })
+    // What the app itself costs: noted every half minute while painting, and now.
+    p.usage.sample()
+    let memory = { (b: Int) in "\(Int((Double(b) / 1_048_576).rounded())) MB" }
+    var cost = "Cost · "
+    if let r = p.usage.recent() {
+      cost += String(format: "%.1f %% of a core · ", r.core) + memory(r.memory) + (r.milliwatts > 0 ? " · \(Int(r.milliwatts.rounded())) mW" : "")
+    } else {
+      cost += memory(p.usage.samples.last?.memory ?? 0) + " · measuring"
+    }
+    m.addItem(.sectionHeader(title: cost))
+    let graph = NSMenuItem()
+    graph.view = Graph(p.usage.history(), tip: "The app's own processor use and memory over the last hour, drawing new landscape included. "
+                       + "Moving the picture on screen is done by macOS and is not counted here: it follows Motion (now \(running) frames a second).")
+    m.addItem(graph)
     m.addItem(.separator())
     // Not in the original: there the shell owns the plugin's life.
     m.addItem(Item("Quit") { self.p.save(); NSApp.terminate(nil) })

@@ -73,23 +73,25 @@ static int size(int w, int h, int steps) {
       unsigned code = (v >> 8) % 3 == 0 ? 0 : 1 + (v >> 12) % 65535;
       o[(y * ow + x) * 2] = (uint8_t)(code >> 8); o[(y * ow + x) * 2 + 1] = (uint8_t)code;
     }
-    for (int variant = 0; variant < 4; variant++) {
-      // 0 paper alone, 1 the layer in front (grain), 2 a middle layer, 3 the back layer (mist)
-      Paint p = {variant == 0 ? q1 : q2, variant == 0 ? 1 : 2, w, h, o, ow, oh, 40 * view, view, 0, 140, 40,
-                  variant <= 1 ? 0.06 : 0, variant == 3 ? 0.35 : 0, variant == 0 || variant == 3, variant == 0 ? 0 : 300, variant == 0 ? h : 1900,
-                  {0.95f, 0.91f, 0.84f}, {0.17f, 0.17f, 0.17f}};
+    for (int variant = 0; variant < 8; variant++) {
+      // 0 paper alone, 1 the layer in front (grain), 2 a middle layer, 3 the back layer (mist);
+      // 4 and 5 are 0 and 3 in one byte a pixel (mono), 6 and 7 opaque with the paper in
+      const int kind = variant < 4 ? variant : (variant % 2 == 0 ? 0 : 3), px = variant == 4 || variant == 5 ? 1 : 4, opaque = variant >= 6;
+      Paint p = {kind == 0 ? q1 : q2, kind == 0 ? 1 : 2, w, h, o, ow, oh, 40 * view, view, 0, 140, 40,
+                  kind <= 1 ? 0.06 : 0, kind == 3 ? 0.35 : 0, kind == 0 || kind == 3, kind == 0 ? 0 : 300, kind == 0 ? h : 1900,
+                  {0.95f, 0.91f, 0.84f}, {0.17f, 0.17f, 0.17f}, px == 1, opaque};
       int nt = (w + T - 1) / T, hh = p.y1 - p.y0;
       uint8_t **tile = malloc(sizeof(void *) * nt);
       List **l = malloc(sizeof(void *) * nt);
       double f0 = 40 * view + 500, f = f0, step = view / 60 / 12;
       p.front = f0;
       double ta = now();
-      for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; tile[j] = malloc((size_t)T * 4 * hh); paint(&p, j * T, x1, tile[j], T * 4); }
+      for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; tile[j] = malloc((size_t)T * px * hh); paint(&p, j * T, x1, tile[j], T * px); }
       double tb = now();
       for (int j = 0; j < nt; j++) l[j] = NULL;
       // The first step makes the lists.
       int kept = 0;
-      { double from = f; f += step; p.front = f; for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; advance(&p, &l[j], j * T, x1, from, tile[j], T * 4); kept += l[j] != NULL; } }
+      { double from = f; f += step; p.front = f; for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; advance(&p, &l[j], j * T, x1, from, tile[j], T * px); kept += l[j] != NULL; } }
       if (!kept) whole = 1;
       double tc = now();
       // The dense painting against the shader.
@@ -97,7 +99,7 @@ static int size(int w, int h, int steps) {
       for (int round = 0; round < 2; round++) {
         if (round == 1) {
           double t0 = now(); long items = 0;
-          for (int v = 0; v < steps; v++) { double from = f; f += step; p.front = f; for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; if (reaches(&p, j * T, x1, from)) items += advance(&p, &l[j], j * T, x1, from, tile[j], T * 4); } }
+          for (int v = 0; v < steps; v++) { double from = f; f += step; p.front = f; for (int j = 0; j < nt; j++) { int x1 = (j + 1) * T > w ? w : (j + 1) * T; if (reaches(&p, j * T, x1, from)) items += advance(&p, &l[j], j * T, x1, from, tile[j], T * px); } }
           double t1 = now();
           printf("  step %.3f ms, %ld tiles changed a step; ", (t1 - t0) / steps, items / steps);
         }
@@ -105,9 +107,10 @@ static int size(int w, int h, int steps) {
           int x1 = (j + 1) * T > w ? w : (j + 1) * T;
           for (int y = p.y0; y < p.y1; y += 3) for (int x = j * T; x < x1; x++) {
             float s[3]; shader(&p, x, y, s);
-            const uint8_t *b = tile[j] + (long)(y - p.y0) * T * 4 + (x - j * T) * 4;
+            const uint8_t *b = tile[j] + (long)(y - p.y0) * T * px + (x - j * T) * px;
             for (int c = 0; c < 3; c++) {
-              float ours = b[2 - c] + (255 - b[3]) * p.paper[c];
+              // Mono: the system puts the ink on the paper by the share.
+              float ours = px == 1 ? (p.paper[c] + (p.ink[c] - p.paper[c]) * b[0] / 255.0f) * 255.0f : b[2 - c] + (255 - b[3]) * p.paper[c];
               float d = fabsf(ours - s[c] * 255.0f);
               if (round == 0) { if (d > maxDense) maxDense = (long)(d + 0.5f); }
               else { if (d > maxSteps) maxSteps = (long)(d + 0.5f); if (d > 1.5f) differing++; sum += d; nn++; }
@@ -117,8 +120,8 @@ static int size(int w, int h, int steps) {
       }
       if (maxDense > worst) worst = (int)maxDense;
       if (maxSteps > worst) worst = (int)maxSteps;
-      printf("delay %s case %d: dense %.1f ms a tile (max %ld off the shader), first step %.1f ms a tile; after the steps max %ld, mean %.3f, over 1.5: %ld of %ld\n",
-             fine ? "1:1" : "1:2", variant, (tb - ta) / nt, maxDense, (tc - tb) / nt, maxSteps, sum / nn, differing, nn);
+      printf("delay %s case %d%s: dense %.1f ms a tile (max %ld off the shader), first step %.1f ms a tile; after the steps max %ld, mean %.3f, over 1.5: %ld of %ld\n",
+             fine ? "1:1" : "1:2", kind, px == 1 ? " mono" : (opaque ? " opaque" : ""), (tb - ta) / nt, maxDense, (tc - tb) / nt, maxSteps, sum / nn, differing, nn);
       for (int j = 0; j < nt; j++) { freeList(l[j]); free(tile[j]); }
       free(tile); free(l);
     }

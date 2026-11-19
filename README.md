@@ -31,14 +31,20 @@ off.
 | | |
 |---|---|
 | **Pause**, **Skip ahead**, **New landscape** | stop the brush, jump half a screen, or start over on blank paper |
+| **Lightest settings** | one layer, half resolution, 6 frames a second, ten minutes a screen and less energy, in one go |
 | **Speed** | how long the brush takes to cross the screen, from 15 seconds to 10 minutes; five minutes to begin with |
 | **Motion** | frames a second at most, 6 to 60. A slow brush uses fewer by itself |
 | **Resolution** | how finely the landscape is drawn, 50 to 100 % of the screen's own pixels. Less is softer and takes less memory |
 | **Colors** | *Theme* follows the Mac's light or dark appearance, *Accent* draws in your accent colour, *Rice paper* is dark ink on cream. *Invert* swaps ink and paper |
 | **Depth** | one, two or three layers. With more than one, the far mountains move slower than the near hills |
+| **Prefer** | *Less energy* lets the Mac's graphics do the least work; *Less memory* uses about half the memory and a little more energy |
+| **Ease off in Low Power Mode** | half the frames while the Mac is in Low Power Mode |
+| **Cost** | what the app itself spends: share of a core, memory and energy over the last five minutes, and the last hour as a line. What macOS spends moving the picture follows *Motion* and is not counted |
 
-For the screen saver, choose **Shan Shui** in System Settings > Screen Saver. It carries on
-with the landscape on your desktop, and the desktop picks up where the screen saver stopped.
+For the screen saver, choose **Shan Shui** in System Settings > Screen Saver. macOS keeps
+the app out of the screen saver's folder, so the screen saver paints a landscape of its own,
+always with the least work: one layer, half resolution, at most 6 frames a second and ten
+minutes a screen.
 
 The recording at the top is the app itself on an empty desktop, with the pointer led by a
 script (`Tools/demo.swift`). It runs at 30 seconds a screen so there is something to see;
@@ -61,20 +67,27 @@ one core on the app's main thread:
 As it comes, the paper rolls at every frame but new ink is laid a little less often.
 
 A new stretch of landscape is drawn about once a screen, by a helper process at background
-priority that exits when it is done.
+priority that exits when it is done. At 3440×1440 that takes about 1.7 seconds of one core,
+about 0.3 % of a core over ten minutes a screen; a lower *Resolution* makes it less. In Low
+Power Mode the paper rolls at half the frame rate.
 
 ## Settings and commands
 
 The menu writes `~/.config/shanshui/config.json`, and the app reads it again whenever it
 changes. Ink and paper (`ink`, `paper`) also take any `#rrggbb`.
 
-Three things are not in the menu and are set in that file. They are on and take `false`:
+Some things are not in the menu and are set in that file. These are on and take `false`:
 
 | | |
 |---|---|
 | `inkInSteps` | new ink is laid in small steps instead of at every frame. Less work for the Mac |
 | `fineEdge` | each stroke comes in pixel by pixel instead of two by two. A little more memory |
 | `fpsAuto` | only the frames the motion needs are drawn, up to the *Motion* maximum |
+| `displayColors` | the painting is kept in the screen's own colours, so the Mac need not convert it at every frame |
+
+`back` is how the back layer is kept (*Prefer* in the menu): `"opaque"` (the default) with the
+paper in it, which the Mac need not blend; `"mono"` one byte a pixel, with the Mac putting the
+ink's colour on it, about half the memory; or `"blend"`, as the layers in front are kept.
 
 The running app can be told what to do from a script:
 

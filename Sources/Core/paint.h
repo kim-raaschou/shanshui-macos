@@ -27,6 +27,8 @@ typedef struct {
   int y0, y1;        // the rows to paint
   float paper[3];    // r, g, b
   float ink[3];
+  int mono;          // 1 on the back layer: one byte a pixel, how much of the ink is over the paper
+  int opaque;        // 1 on the back layer: BGRA with the paper in it, alpha always 255
 } Paint;
 
 // The columns x0..x1, whole. `dst` is the pixel of column x0 in row y0;

@@ -132,6 +132,35 @@ static inline uint32_t pixel(const Paint *p, float a, const uint8_t *q, float g)
   return color;
 }
 
+// The same pixel over the paper alone, as one byte: its share of the ink. Over
+// the paper, ink * ti + paper * pa + paper * (1 - al) is paper + (ink - paper) * ti,
+// grain and mist included, so the colour is the system's to put on (mono).
+static inline uint8_t share(const Paint *p, float a, const uint8_t *q, float g) {
+  const float clear = (float)(1.0 - p->mist);
+  float r = (float)q[0] * (1.0f / 255.0f);
+  float qa = p->channels == 2 ? (float)q[1] * (1.0f / 255.0f) : 1.0f;
+  float ti = clear * (qa - r) * a;
+  ti = ti * (1.0f - g) + g;
+  return (uint8_t)(255.0f * ti + 0.5f);
+}
+
+// Opaque: the colour of every share, with the paper in it and nothing to blend.
+static void shades(const Paint *p, uint32_t *lut) {
+  for (int s = 0; s < 256; s++) {
+    uint32_t color = 0xFFu << 24;
+    for (int c = 0; c < 3; c++) color |= (uint32_t)((p->paper[c] + (p->ink[c] - p->paper[c]) * (float)s * (1.0f / 255.0f)) * 255.0f + 0.5f) << (16 - 8 * c);
+    lut[s] = color;
+  }
+}
+
+// Large arrays straight from the system, so that letting go of them gives the
+// memory back at once.
+static void *pages(size_t bytes) {
+  void *m = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  return m == MAP_FAILED ? NULL : m;
+}
+static void unpages(void *m, size_t bytes) { if (m) munmap(m, bytes); }
+
 void paint(const Paint *p, int x0, int x1, uint8_t *dst, long stride) {
   const int n = x1 - x0;
   if (n <= 0) return;
@@ -140,18 +169,24 @@ void paint(const Paint *p, int x0, int x1, uint8_t *dst, long stride) {
   openColumns(&c, p, x0, n, p->w);
   int *ox = malloc(sizeof(int) * (size_t)n);
   for (int i = 0; i < n; i++) ox[i] = delayAt(x0 + i, p->w, p->ow) * 2;
+  uint32_t lut[256];
+  if (p->opaque) shades(p, lut);
   for (int y = p->y0; y < p->y1; y++) {
     wave(&c, y, p->h);
     const float my = worldY(y, p->h);
     const uint8_t *ol = p->o + (long)delayAt(y, p->h, p->oh) * p->ow * 2;
     const uint8_t *ql = p->q + ((long)y * p->w + x0) * p->channels;
-    uint32_t *restrict out = (uint32_t *)(void *)(dst + (long)(y - p->y0) * stride);
+    uint8_t *restrict row = dst + (long)(y - p->y0) * stride;
+    uint32_t *restrict out = (uint32_t *)(void *)row;
     for (int i = 0; i < n; i++) {
       // The front is taken at the pixel: its own x and the wave there. The
       // paper, which has no delay, is always in.
       const int code = ol[ox[i]] << 8 | ol[ox[i] + 1];
       const float a = code > 0 ? inkIn((front - (c.rel[i] + (float)(code - 1) * spread + c.wave[i])) * softness) : 1.0f;
-      out[i] = pixel(p, a, ql + i * p->channels, p->grain > 0.0 ? grainAt(p, c.gx[i], grainRow(my)) : 0.0f);
+      const float g = p->grain > 0.0 ? grainAt(p, c.gx[i], grainRow(my)) : 0.0f;
+      if (p->mono) row[i] = share(p, a, ql + i * p->channels, g);
+      else if (p->opaque) out[i] = lut[share(p, a, ql + i * p->channels, g)];
+      else out[i] = pixel(p, a, ql + i * p->channels, g);
     }
   }
   free(ox);
@@ -183,6 +218,10 @@ struct List {
   int gcols;
   uint32_t grainColor[256];
   uint16_t rest[256];
+  // Opaque: the colour of each share, the paper in it.
+  uint32_t lut[256];
+  // `items` and `offset` are the system's pages, given back whole when let go.
+  size_t itemBytes, offsetBytes;
 };
 
 // The first of the pixels a..b, from a, in each of the delay's o0..o0 + n - 1; and b.
@@ -215,7 +254,7 @@ static List *makeList(const Paint *p, int x0, int x1) {
   s->ys = cuts(p->y0, p->y1, p->h, p->oh, r0, rn);
   // The picture's own columns, for what is kept per pixel.
   openColumns(&f, p, x0, n, p->w);
-  if (p->ow != p->w || p->oh != p->h) s->offset = malloc((size_t)n * (size_t)tall);
+  if (p->ow != p->w || p->oh != p->h) { s->offsetBytes = (size_t)n * (size_t)tall; s->offset = pages(s->offsetBytes); }
   if (p->grain > 0.0) {
     // The grain's cells are larger than a fine strip's pixels: each cell once.
     s->gcol = malloc(sizeof(uint16_t) * (size_t)n);
@@ -248,7 +287,7 @@ static List *makeList(const Paint *p, int x0, int x1) {
   // Only for the making: taken from the system and given straight back.
   const size_t itemBytes = sizeof(uint64_t) * (size_t)on * (size_t)rn;
   uint64_t *item = mmap(NULL, itemBytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-  if (item == MAP_FAILED) { closeColumns(&l); closeColumns(&f); free(s->xs); free(s->ys); free(s->offset); free(s->grains); free(s->gcol); free(s->grow); free(s); return NULL; }
+  if (item == MAP_FAILED) { closeColumns(&l); closeColumns(&f); free(s->xs); free(s->ys); unpages(s->offset, s->offsetBytes); free(s->grains); free(s->gcol); free(s->grow); free(s); return NULL; }
   long total = 0;
   s->start = calloc((size_t)(s->buckets + 2), sizeof(int));
   for (int r = 0; r < rn; r++) {
@@ -287,7 +326,8 @@ static List *makeList(const Paint *p, int x0, int x1) {
     }
   }
   for (int b = 0; b < s->buckets; b++) s->start[b + 2] += s->start[b + 1];
-  s->items = malloc(sizeof(uint32_t) * (size_t)(total > 0 ? total : 1));
+  s->itemBytes = sizeof(uint32_t) * (size_t)(total > 0 ? total : 1);
+  s->items = pages(s->itemBytes);
   for (long i = 0; i < total; i++) s->items[s->start[(item[i] >> 32) + 1]++] = (uint32_t)item[i];
   munmap(item, itemBytes);
   closeColumns(&f);
@@ -297,19 +337,21 @@ static List *makeList(const Paint *p, int x0, int x1) {
   for (int i = 0; i < tones; i++) {
     const int r = i & 255, qa = p->channels == 2 ? i >> 8 : 255;
     const uint8_t q[2] = {(uint8_t)(r < qa ? r : qa), (uint8_t)qa};
-    s->full[i] = pixel(p, 1.0f, q, 0.0f);
+    s->full[i] = p->mono || p->opaque ? share(p, 1.0f, q, 0.0f) : pixel(p, 1.0f, q, 0.0f);
   }
   for (int i = 0; i < 256; i++) {
     const float g = (float)i * (1.0f / 255.0f) * strongest;
-    s->grainColor[i] = pixel(p, 0.0f, (const uint8_t[2]){0, 0}, g);
+    const uint8_t none[2] = {0, 0};
+    s->grainColor[i] = p->mono || p->opaque ? share(p, 0.0f, none, g) : pixel(p, 0.0f, none, g);
     s->rest[i] = (uint16_t)((1.0f - g) * 256.0f);
   }
+  if (p->opaque) shades(p, s->lut);
   return s;
 }
 
 void freeList(List *l) {
   if (!l) return;
-  free(l->start); free(l->items); free(l->xs); free(l->ys); free(l->offset); free(l->full); free(l->grains); free(l->gcol); free(l->grow);
+  free(l->start); unpages(l->items, l->itemBytes); free(l->xs); free(l->ys); unpages(l->offset, l->offsetBytes); free(l->full); free(l->grains); free(l->gcol); free(l->grow);
   free(l);
 }
 
@@ -354,13 +396,21 @@ static int repaint(const Paint *p, const List *l, int x0, int n, double from, ui
         const int8_t *dl = dv ? dv + (long)y * n : NULL;
         const uint8_t *gl = l->grains ? l->grains + (long)l->grow[y] * l->gcols : NULL;
         const uint16_t *gc = l->gcol;
-        uint32_t *out = (uint32_t *)(void *)(dst + (long)y * stride);
+        uint8_t *row = dst + (long)y * stride;
+        uint32_t *out = (uint32_t *)(void *)row;
         for (int x = l->xs[t]; x < l->xs[t + 1]; x++) {
           const uint32_t amount = dl ? inside(place - dl[x] * perOffset) : whole;
           const uint32_t e = l->full[p->channels == 2 ? ql[x * 2] | ql[x * 2 + 1] << 8 : ql[x]];
           const uint32_t g = gl ? gl[gc[x]] : 0;
           const uint32_t m = gl ? (amount * l->rest[g]) >> 8 : amount;
-          out[x] = (((((e & pair) * m + half) >> 8) & pair) | ((((e >> 8) & pair) * m + half) & ~pair)) + (gl ? l->grainColor[g] : 0);
+          // One byte: the share alone, rounded as each channel is.
+          if (p->mono || p->opaque) {
+            const uint8_t s = (uint8_t)(((e * m + (half & 0xFFu)) >> 8) + (gl ? l->grainColor[g] : 0));
+            if (p->mono) row[x] = s;
+            else out[x] = l->lut[s];
+            continue;
+          }
+          out[x] =(((((e & pair) * m + half) >> 8) & pair) | ((((e >> 8) & pair) * m + half) & ~pair)) + (gl ? l->grainColor[g] : 0);
         }
       }
     }

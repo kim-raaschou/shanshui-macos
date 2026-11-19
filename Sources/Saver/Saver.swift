@@ -36,8 +36,16 @@ final class SaverView: ScreenSaverView {
   override func startAnimation() {
     super.startAnimation()
     SaverView.activeViews.add(self)
+    // The thumbnail's size before anything is made, or the first strip is
+    // made for the whole screen.
+    SaverView.thumbnail()
     SaverView.begin()
     SaverView.check()
+  }
+
+  override func setFrameSize(_ size: NSSize) {
+    super.setFrameSize(size)
+    if isPreview, SaverView.activeViews.contains(self) { SaverView.thumbnail() }
   }
 
   override func stopAnimation() {
@@ -54,6 +62,7 @@ final class SaverView: ScreenSaverView {
     Landscape.saver = true
     let p = Landscape.shared
     p.onChange = { redraw() }
+    p.onFrame = { redraw() }
     p.begin()
     // The host does not always tell its views to stop, and may stay alive
     // after the saver is gone: this is what ends the painting then.
@@ -66,8 +75,21 @@ final class SaverView: ScreenSaverView {
 
   /// No view is being shown: the painting freezes.
   private static func check() {
+    thumbnail()
     Landscape.shared.covered = activeViews.count == 0
     redraw()
+  }
+
+  /// Only the thumbnail in System Settings is shown: strips as small as it.
+  /// One not laid out yet has no size, and is not counted.
+  private static func thumbnail() {
+    let views = activeViews.allObjects
+    guard !views.isEmpty, views.allSatisfy(\.isPreview) else { Landscape.shared.preview = nil; return }
+    let sizes = views.filter { $0.bounds.width > 0 && $0.bounds.height > 0 }.map { v -> (w: Int, h: Int) in
+      let scale = v.window?.backingScaleFactor ?? 2
+      return (Int((v.bounds.width * scale).rounded()), Int((v.bounds.height * scale).rounded()))
+    }
+    Landscape.shared.preview = sizes.max { $0.w * $0.h < $1.w * $1.h } ?? (640, 360)
   }
 
   private static func redraw() {

@@ -91,6 +91,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
       service?.update()
       menu?.update()
     }
+    p.onFrame = { [unowned self] in service?.redraw() }
     DistributedNotificationCenter.default().addObserver(forName: ipcChannel, object: nil, queue: .main) { n in
       let a = (n.object as? String ?? "").split(separator: " ").map(String.init)
       commands.first { $0.key == a.first }?.value(p, a)

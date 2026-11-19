@@ -26,8 +26,22 @@ final class Service {
   }
 
   private func build() {
-    for j in windows { j.window.orderOut(nil) }
-    windows = NSScreen.screens.map { screen in
+    let screens = NSScreen.screens
+    // As many screens as windows: the windows stay, placed again. The
+    // notification also comes for the Dock, the menu bar and waking up.
+    if screens.count == windows.count {
+      for (j, screen) in zip(windows, screens) where j.window.frame != screen.frame { j.window.setFrame(screen.frame, display: false) }
+      update()
+      return
+    }
+    // The old windows go with their layers, or they keep the tiles they show.
+    for j in windows {
+      j.view.canvas.clear()
+      j.window.orderOut(nil)
+      j.window.contentView = nil
+      j.window.close()
+    }
+    windows = screens.map { screen in
       let j = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
       j.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
       j.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
@@ -67,7 +81,7 @@ final class Service {
     redraw()
   }
 
-  private func redraw() {
+  func redraw() {
     // Turned off or covered, nothing is kept painted.
     let active = Landscape.shared.active
     Painting.shared.show(windows.map {

@@ -24,6 +24,59 @@ final class Landscape {
     let picture: Bitmap, delay: Bitmap
   }
 
+  /// What the app itself costs, for the menu: noted when a save runs (every
+  /// half minute while painting) and when the menu opens, never by a timer of
+  /// its own. The last hour is kept. What macOS spends moving the picture on
+  /// screen is not the app's to see.
+  final class Usage {
+    struct Sample {
+      let time: Double    // seconds
+      let cpu: Double     // seconds of processor, the strips' helper included
+      let energy: Double  // joules of processor, 0 when the system does not tell
+      let memory: Int     // bytes, as Activity Monitor counts them
+    }
+    private(set) var samples: [Sample] = []
+
+    func sample() {
+      var r = rusage()
+      getrusage(RUSAGE_CHILDREN, &r)
+      let helper = Double(r.ru_utime.tv_sec + r.ru_stime.tv_sec) + Double(r.ru_utime.tv_usec + r.ru_stime.tv_usec) / 1e6
+      let own = Double(clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)) / 1e9
+      var info = rusage_info_v6()
+      let told = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V6, $0) }
+      } == 0
+      var vm = task_vm_info_data_t()
+      var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+      let read = withUnsafeMutablePointer(to: &vm) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+      } == KERN_SUCCESS
+      samples.append(Sample(time: ProcessInfo.processInfo.systemUptime, cpu: own + helper,
+                            energy: told ? Double(info.ri_energy_nj) / 1e9 : 0, memory: read ? Int(vm.phys_footprint) : 0))
+      if samples.count > 120 { samples.removeFirst(samples.count - 120) }
+    }
+
+    /// The share of one core and the milliwatts over the last `seconds`, and
+    /// the memory now; nil before two samples.
+    func recent(_ seconds: Double = 300) -> (core: Double, milliwatts: Double, memory: Int)? {
+      guard let last = samples.last, let first = samples.last(where: { $0.time <= last.time - seconds }) ?? samples.first,
+            last.time - first.time > 1 else { return nil }
+      let t = last.time - first.time
+      return ((last.cpu - first.cpu) / t * 100, (last.energy - first.energy) / t * 1000, last.memory)
+    }
+
+    /// Milliwatts (or, without energy, the share of a core) between each two
+    /// samples of the last hour; nil where it was not painting (a gap).
+    func history() -> [Double?] {
+      zip(samples, samples.dropFirst()).map { a, b in
+        let t = b.time - a.time
+        guard t > 1, t < 45 else { return nil }
+        return b.energy > 0 ? (b.energy - a.energy) / t * 1000 : (b.cpu - a.cpu) / t * 100
+      }
+    }
+  }
+  let usage = Usage()
+
   /// The settings, the state and the strips' folder under a home folder: the
   /// user's, or the screen saver's container (which has no XDG variables).
   struct Folders {
@@ -56,6 +109,9 @@ final class Landscape {
     "fpsAuto": true,        // only the fps the motion asks for, at most the one above
     "fineEdge": true,       // the delay as big as the strip (the original: half the screen)
     "inkInSteps": true,     // the ink comes in by steps (the original: at every frame)
+    "back": "opaque",       // the back layer's tiles: "opaque" (least work for the system), "mono" (one byte a pixel) or "blend"
+    "easeLowPower": true,   // half the frame rate in Low Power Mode
+    "displayColors": true,  // the tiles in the screen's colours, not sRGB
   ]
 
   var options: [String: Any] = Landscape.defaults {
@@ -69,7 +125,9 @@ final class Landscape {
   var active = true { didSet { changed() } }
   var paused = false { didSet { changed() } }
   var seed = ""
-  var front = 0.0 { didSet { changed() } }
+  var front = 0.0 { didSet { if !walking { changed() } } }
+  /// The front's walk at each frame: only the painting follows it (onFrame).
+  private var walking = false
   var ready = false { didSet { changed() } }
   /// "" | "generate": what keeps it from painting, for the menu to tell.
   var problem = "" { didSet { changed() } }
@@ -114,20 +172,38 @@ final class Landscape {
   var covered = false {
     didSet {
       guard covered != oldValue else { return }
-      if !covered { adopt() }
+      // Where it stopped is kept now: no save runs while it is covered.
+      if covered { save() }
       changed()
     }
   }
 
   /// The world's view is as tall as Generator.viewH; the width follows the largest monitor.
   var screen: (w: Int, h: Int) = (1920, 1080)
+  /// That monitor's width in points, and its colours.
+  var screenPoints = 1920
+  var screenSpace: CGColorSpace = Svg.srgb
   func measureScreen() {
     let screens = NSScreen.screens.map {
-      (w: Int(($0.frame.width * $0.backingScaleFactor).rounded()), h: Int(($0.frame.height * $0.backingScaleFactor).rounded()))
+      (w: Int(($0.frame.width * $0.backingScaleFactor).rounded()), h: Int(($0.frame.height * $0.backingScaleFactor).rounded()),
+       points: Int($0.frame.width.rounded()), space: $0.colorSpace?.cgColorSpace)
     }
     // Of two as large, the first.
-    screen = screens.max { $0.w * $0.h < $1.w * $1.h } ?? (1920, 1080)
+    let largest = screens.max { $0.w * $0.h < $1.w * $1.h }
+    screen = largest.map { ($0.w, $0.h) } ?? (1920, 1080)
+    screenPoints = largest?.points ?? 1920
+    // Only an RGB one can hold the tiles' colours.
+    screenSpace = largest?.space.flatMap { $0.model == .rgb ? $0 : nil } ?? Svg.srgb
+    // The screen saver's thumbnail alone: strips as small as it.
+    if let preview {
+      screen = preview
+      screenPoints = preview.w
+    }
     arrange()
+  }
+  /// The screen saver shown only as System Settings' thumbnail, in pixels.
+  var preview: (w: Int, h: Int)? {
+    didSet { if preview?.w != oldValue?.w || preview?.h != oldValue?.h { measureScreen() } }
   }
   var stripScale: Double { number(options["resolution"], 0.4, 1, 1) }
   var stripSize: (w: Int, h: Int) {
@@ -183,6 +259,13 @@ final class Landscape {
   /// strip, where that is more.
   var fullDelay: Bool { (options["fineEdge"] as? Bool) == true && stripScale > 0.5 }
 
+  /// How the back layer's tiles keep their pixels (Painting.Kind).
+  var back: Painting.Kind { (options["back"] as? String).flatMap(Painting.Kind.init) ?? .opaque }
+  /// Half the frame rate while the Mac is in Low Power Mode.
+  var easeLowPower: Bool { (options["easeLowPower"] as? Bool) != false }
+  /// The tiles in the screen's colours, so the system need not match each pixel.
+  var displayColors: Bool { (options["displayColors"] as? Bool) != false }
+
   func strip(_ c: Int, _ k: Int) -> Strip? { strips[places(c)].compactMap { $0 }.first { $0.k == k } }
 
   func stripReady(_ c: Int, _ k: Int) -> Bool { strip(c, k)?.key == key(c, k) }
@@ -229,17 +312,22 @@ final class Landscape {
                 "--delay-scale", String(scale)]
     if full { args.append("--full") }
     if let cs = wantedLayers { args += ["--layer", cs.map(String.init).joined(separator: ","), "--layers", String(of)] }
+    // A strip is made half a screen ahead: there is time for the efficiency
+    // cores. Only the opening, which runs, waits for it.
+    let qos: QualityOfService = front < openingUntil ? .utility : .background
     let thread = Thread {
       let r = autoreleasepool { Result { () -> [(Bitmap, Bitmap)] in
         if Landscape.saver {
           // The screen saver's sandbox starts no process: the strip is made
-          // here (one made before is only read).
+          // here (one made before is only read). What the generator took is
+          // given back at once, or the system's host keeps it.
+          defer { malloc_zone_pressure_relief(nil, 0) }
           try Generator.strip(dir: dir, seed: seed, k: k, w: size.w, h: size.h, scale: scale, layers: wantedLayers, of: of, full: full)
         } else if !urls.allSatisfy({ Generator.existsValid($0.q) && Generator.existsValid($0.o) }) {
           let proc = Process()
           proc.executableURL = Bundle.main.executableURL
           proc.arguments = args
-          proc.qualityOfService = .utility
+          proc.qualityOfService = qos
           proc.standardOutput = FileHandle.nullDevice
           try proc.run()
           proc.waitUntilExit()
@@ -267,7 +355,7 @@ final class Landscape {
     }
     // The generator recurses deeply when it runs here.
     thread.stackSize = 32 << 20
-    thread.qualityOfService = .utility
+    thread.qualityOfService = qos
     thread.start()
   }
 
@@ -287,44 +375,16 @@ final class Landscape {
     let dir = folders.cache
     DispatchQueue.global(qos: .background).async {
       Generator.clear(dir: dir, keep: keep)
-      self.mirror(keep)
     }
   }
 
-  // ---- the screen saver's copy
+  // ---- the screen saver's settings
   //
   // The screen saver lives in the system's sandbox and sees only its own
-  // folder. The app keeps a copy of the settings, the state and the strips on
-  // screen there, so the saver goes on with the same landscape at once; and
-  // takes back how far the saver painted.
-
-  private var mirrorFolders: Folders? {
-    let u = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Containers/com.apple.ScreenSaver.Engine.legacyScreenSaver/Data")
-    return !Landscape.saver && FileManager.default.fileExists(atPath: u.path) ? Folders(u) : nil
-  }
-
-  /// The same landscape, painted farther by the screen saver: goes on from there.
-  private func adopt() {
-    guard loaded, let e = mirrorFolders.flatMap({ Landscape.read($0.state) }), e["seed"] as? String == seed else { return }
-    let f = number(e["front"], 0, 1e9, 0)
-    if f > front + 1 { front = f; arrange() }
-  }
-
-  private func mirror(_ keep: Set<String>? = nil) {
-    guard let base = mirrorFolders else { return }
-    let fm = FileManager.default
-    for (from, to) in [(folders.config, base.config), (folders.state, base.state)] {
-      guard let d = try? Data(contentsOf: from) else { continue }
-      try? fm.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
-      try? d.write(to: to, options: .atomic)
-    }
-    guard let keep else { return }
-    try? fm.createDirectory(at: base.cache, withIntermediateDirectories: true)
-    for name in keep where !fm.fileExists(atPath: base.cache.appendingPathComponent(name).path) {
-      try? fm.copyItem(at: folders.cache.appendingPathComponent(name), to: base.cache.appendingPathComponent(name))
-    }
-    Generator.clear(dir: base.cache, keep: keep)
-  }
+  // folder, and the system keeps other apps out of it: it cannot have the
+  // app's settings, state or strips. It paints its own landscape, with the
+  // least work.
+  static let saverDefaults: [String: Any] = ["resolution": 0.5, "fps": 6, "minutesPerScreen": 10, "depth": false]
 
   // ---- actions
 
@@ -346,7 +406,6 @@ final class Landscape {
     for (k, v) in Landscape.defaults where o[k] == nil { o[k] = options[k] ?? v }
     options = o
     write(o, folders.config)
-    mirror()
   }
 
   func pause() { paused = true; save() }
@@ -357,11 +416,16 @@ final class Landscape {
   /// Moves the front n screens at once.
   func skip(_ screens: Double) { front += screens * viewWidth; save(); arrange() }
 
+  /// What was written last: the same is not written again.
+  private var saved: NSDictionary?
   func save() {
     guard loaded else { return }
-    adopt()
-    write(["on": active, "paused": paused, "seed": seed, "front": (front * 10).rounded() / 10], folders.state)
-    mirror()
+    // The save runs every half minute while painting: the cost is noted then.
+    usage.sample()
+    let o: NSDictionary = ["on": active, "paused": paused, "seed": seed, "front": (front * 10).rounded() / 10]
+    if saved == o { return }
+    saved = o
+    write(o as? [String: Any] ?? [:], folders.state)
   }
 
   private func write(_ o: [String: Any], _ url: URL) {
@@ -375,12 +439,15 @@ final class Landscape {
   // ---- timers
 
   /// Frames per second: the menu's is the maximum. With fpsAuto, only what the
-  /// motion asks for (one pixel per frame, at least 2). The opening, which
-  /// runs, uses the maximum.
+  /// motion asks for (one point per frame, or one of the strip's pixels where
+  /// they are coarser; at least 2). The opening, which runs, uses the maximum.
   var fpsMax: Double { number(options["fps"], 1, 60, 12) }
   var fpsNow: Double {
-    if (options["fpsAuto"] as? Bool) == false || front < openingUntil { return fpsMax }
-    return max(2, min(fpsMax, Double(screen.w) / secondsPerScreen))
+    // In Low Power Mode, half as many.
+    let share = easeLowPower && ProcessInfo.processInfo.isLowPowerModeEnabled ? 0.5 : 1
+    if (options["fpsAuto"] as? Bool) == false || front < openingUntil { return max(1, fpsMax * share) }
+    let steps = Double(min(screenPoints, stripSize.w))
+    return max(1, max(2, min(fpsMax, steps / secondsPerScreen)) * share)
   }
 
   private var lastTick = 0.0
@@ -411,19 +478,31 @@ final class Landscape {
     // The front only walks on paper that already exists.
     guard frontReady() else { return }
     var v = viewWidth / secondsPerScreen
+    let screen = frontScreen, opening = openingUntil
     if front < openingUntil { v = max(v, viewWidth / 4) } else { openingUntil = -1 }
+    walking = true
     front += v * dt
+    walking = false
+    // The rest (the menu, the timers) changes only with a new screen or the
+    // end of the opening; at the other frames only the painting follows.
+    if frontScreen != screen || openingUntil != opening {
+      changed()
+      return
+    }
+    onFrame?()
   }
 
   private func adjust() {
     let run = active && loaded && !paused && !covered
     if run && anim == nil { lastTick = Date().timeIntervalSince1970 }
     keep(&anim, run ? (10000 / fpsNow).rounded() / 10000 : nil) { [unowned self] in tick() }
-    keep(&saveTimer, active && loaded && !paused ? 30 : nil) { [unowned self] in save() }
+    keep(&saveTimer, active && loaded && !paused && !covered ? 30 : nil) { [unowned self] in save() }
   }
 
-  /// Called when anything the screen or the timers depend on has changed.
+  /// Called when anything the screen or the timers depend on has changed;
+  /// `onFrame` when only the front has walked.
   var onChange: (() -> Void)?
+  var onFrame: (() -> Void)?
   private var dirty = false
   func changed() {
     guard !dirty else { return }
@@ -441,6 +520,7 @@ final class Landscape {
 
   private func readConfig() {
     var o = Landscape.defaults
+    if Landscape.saver { o.merge(Landscape.saverDefaults) { $1 } }
     let d = try? Data(contentsOf: folders.config)
     if let c = Landscape.json(d) { o.merge(c) { $1 } } else if d != nil { NSLog("shanshui: config.json invalid, using the defaults") }
     if !NSDictionary(dictionary: o).isEqual(to: options) { options = o }
@@ -453,6 +533,10 @@ final class Landscape {
     appearance = NSApp.observe(\.effectiveAppearance) { [unowned self] _, _ in forgetColors() }
     NotificationCenter.default.addObserver(forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main) { [unowned self] _ in
       forgetColors()
+    }
+    // Low Power Mode on or off: the frame rate follows (fpsNow).
+    NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [unowned self] _ in
+      changed()
     }
     let configDir = folders.config.deletingLastPathComponent()
     do {
